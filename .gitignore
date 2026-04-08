@@ -1,5 +1,6 @@
 models/
 data/raw/
+data/arxivData.json
 __pychache__/
 *.pyc
 .env
