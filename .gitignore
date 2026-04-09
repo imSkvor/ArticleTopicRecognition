@@ -5,3 +5,5 @@ __pychache__/
 *.pyc
 .env
 .ipynb_checkpoints/
+output/checkpoints/
+output/onnx/
