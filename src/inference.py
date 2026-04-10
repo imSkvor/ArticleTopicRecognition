@@ -1,11 +1,12 @@
 import json
-from typing import Optional
+from typing import Optional, Union
 
 import tensorrt as trt
 import torch
 from torch import Tensor
 from transformers import AutoTokenizer
 
+from arxiv_taxonomy import arxiv_category_names
 
 class TRTClassifier:
 
@@ -13,7 +14,7 @@ class TRTClassifier:
         self,
         engine_path: str,
         label_mapping_path: str,
-        model_name: str = "bert-base-cased",
+        checkpoint_dir: str,
     ) -> None:
 
         self._logger: trt.Logger = trt.Logger(trt.Logger.ERROR)
@@ -44,7 +45,7 @@ class TRTClassifier:
             int(idx): label for label, idx in mapping_data["label2id"].items()
         }
 
-        self._tokenizer: AutoTokenizer = AutoTokenizer.from_pretrained(model_name)
+        self._tokenizer: AutoTokenizer = AutoTokenizer.from_pretrained(checkpoint_dir)
         self._stream: torch.cuda.Stream = torch.cuda.Stream()
 
     def predict(
@@ -53,7 +54,7 @@ class TRTClassifier:
         abstract: str,
         top_k: Optional[int] = None,
         cumulative_threshold: float = 0.95,
-    ) -> list[tuple[str, float]]:
+    ) -> list[dict[str, Union[float, str]]]:
 
         text: str = f"{title.strip()} {abstract.strip()}" if abstract else title.strip()
 
@@ -65,26 +66,41 @@ class TRTClassifier:
             padding = "max_length",
         )
 
-        input_ids: Tensor = encoded["input_ids"].cuda().to(dtype = torch.int32)
-        attention_mask: Tensor = encoded["attention_mask"].cuda().to(dtype = torch.int32)
+        input_ids: Tensor = encoded["input_ids"].cuda().to(dtype = torch.int64)
+        attention_mask: Tensor = encoded["attention_mask"].cuda().to(dtype = torch.int64)
 
         batch_size: int = input_ids.size(0)
         seq_length: int = input_ids.size(1)
 
         for input_name in self._input_names:
-            if input_name == "input_ids":
-                self._context.set_input_shape(input_name, (batch_size, seq_length))
-            elif input_name == "attention_mask":
-                self._context.set_input_shape(input_name, (batch_size, seq_length))
-            elif input_name == "token_type_ids":
-                token_type_ids: Tensor = torch.zeros(
-                    (batch_size, seq_length), dtype = torch.int32, device = "cuda"
-                )
-                self._context.set_tensor_address(input_name, token_type_ids.data_ptr())
+            self._context.set_input_shape(input_name, (batch_size, seq_length))
+
+        if "token_type_ids" in self._input_names:
+            token_type_ids: Tensor = torch.zeros(
+                (batch_size, seq_length), dtype = torch.int64, device = "cuda"
+            )
+            self._context.set_tensor_address("token_type_ids", token_type_ids.data_ptr())
+
+        self._context.set_tensor_address("input_ids", input_ids.data_ptr())
+        self._context.set_tensor_address("attention_mask", attention_mask.data_ptr())
+
+        # for input_name in self._input_names:
+        #     if input_name == "input_ids":
+        #         self._context.set_input_shape(input_name, (batch_size, seq_length))
+        #     elif input_name == "attention_mask":
+        #         self._context.set_input_shape(input_name, (batch_size, seq_length))
+        #     elif input_name == "token_type_ids":
+        #         token_type_ids: Tensor = torch.zeros(
+        #             (batch_size, seq_length), dtype = torch.int32, device = "cuda"
+        #         )
+        #         self._context.set_tensor_address(input_name, token_type_ids.data_ptr())
 
         output_shape: list[int] = self._context.get_tensor_shape(self._output_name)
+        if output_shape[0] == -1:
+            output_shape[0] = batch_size
+
         output_tensor: Tensor = torch.empty(
-            output_shape, dtype = torch.float32, device = "cuda"
+            tuple(output_shape), dtype = torch.float32, device = "cuda"
         )
 
         self._context.set_tensor_address("input_ids", input_ids.data_ptr())
@@ -97,6 +113,7 @@ class TRTClassifier:
             self._stream.synchronize()
 
         logits: Tensor = output_tensor
+        # print(f"Raw logits (first 5): {logits[0, :5].cpu().tolist()}")
         probabilities: Tensor = torch.softmax(logits, dim = -1).squeeze(0).cpu()
 
         return self._extract_top_classes(
@@ -110,11 +127,11 @@ class TRTClassifier:
         probabilities: Tensor,
         top_k: Optional[int],
         cumulative_threshold: float,
-    ) -> list[tuple[str, float]]:
+    ) -> list[dict[str, Union[str, float]]]: #-> list[tuple[str, float]]:
 
         sorted_indices: Tensor = torch.argsort(probabilities, descending = True)
 
-        result: list[tuple[str, float]] = []
+        result: list[dict[str, Union[str, float]]] = []
         cumulative_sum: float = 0
 
         for rank, idx in enumerate(sorted_indices.tolist()):
@@ -124,10 +141,25 @@ class TRTClassifier:
             prob: float = probabilities[idx].item()
             cumulative_sum += prob
 
-            label: str = self._id2label.get(idx, f"unknown_{idx}")
-            result.append((label, prob))
+            label_code: str = self._id2label.get(idx, f"unknown_{idx}")
+            label_info = self._format_label(label_code)
+
+            result.append({
+                "code": label_info["code"],
+                "name": label_info["name"],
+                "display": label_info["display"],
+                "probability": prob,
+            })
 
             if cumulative_sum >= cumulative_threshold:
                 break
 
         return result
+    
+    def _format_label(self, code: str) -> dict[str, str]:
+        name = arxiv_category_names.get(code, code)
+        return {
+            "code": code,
+            "name": name,
+            "display": f"{name} ({code})"
+        }
